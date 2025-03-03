@@ -1,0 +1,3 @@
+# Protocol Buffer files
+*.pb.cc
+*.pb.h
