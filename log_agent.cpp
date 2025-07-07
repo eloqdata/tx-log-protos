@@ -23,6 +23,7 @@
 
 #include <braft/raft.h>
 #include <braft/route_table.h>
+#include <braft/storage.h>
 #include <braft/util.h>
 #include <brpc/channel.h>
 #include <brpc/controller.h>
@@ -30,8 +31,8 @@
 
 #include <thread>
 
-#include "log_util.h"
 #include "log.pb.h"
+#include "log_util.h"
 
 namespace txlog
 {
@@ -51,21 +52,24 @@ void LogAgent::Init(std::vector<std::string> &ip_list,
                     const uint32_t start_log_group_id,
                     const uint32_t log_group_replica_num)
 {
-    ips_ = ip_list;
-    ports_ = port_list;
+    for (uint32_t i = 0; i < ip_list.size(); ++i)
+    {
+        log_nodes_.try_emplace(i, ip_list[i], port_list[i]);
+    }
     std::pair<std::unordered_map<uint32_t, LogUtil::RaftGroupConfig>, uint32_t>
         log_raft_group_config = LogUtil::GenerateLogRaftGroupConfig(
-            ips_, ports_, start_log_group_id, log_group_replica_num);
+            ip_list, port_list, start_log_group_id, log_group_replica_num);
 
     LogUtil::DumpLogRaftGroupConfig(log_raft_group_config);
 
-    log_group_replica_num_ = log_raft_group_config.second;
     log_group_cnt_ = log_raft_group_config.first.size();
+    log_group_replica_num_ = log_group_replica_num;
 
     for (auto &[log_group_id, raft_group_config] : log_raft_group_config.first)
     {
         std::string log_group_name = raft_group_config.group_name_;
         std::string log_group_conf = raft_group_config.group_conf_;
+        log_group_config_map_.try_emplace(log_group_id, raft_group_config);
         if (braft::rtb::update_configuration(log_group_name, log_group_conf) !=
             0)
         {
@@ -95,36 +99,37 @@ void LogAgent::Init(std::vector<std::string> &ip_list,
             options.timeout_ms = 10000;
             options.max_retry = 3;
             butil::ip_t ip_t;
-            if (0 != butil::str2ip(ips_[node_id].c_str(), &ip_t))
+            if (0 != butil::str2ip(log_nodes_[node_id].first.c_str(), &ip_t))
             {
                 // for case `ips_[node_id]` is hostname format.
                 std::string naming_service_url;
-                braft::HostNameAddr hostname_addr(ips_[node_id],
-                                                  ports_[node_id]);
+                braft::HostNameAddr hostname_addr(log_nodes_[node_id].first,
+                                                  log_nodes_[node_id].second);
                 braft::HostNameAddr2NSUrl(hostname_addr, naming_service_url);
                 if (channel.Init(naming_service_url.c_str(),
                                  braft::LOAD_BALANCER_NAME,
                                  &options) != 0)
                 {
-                    LOG(ERROR)
-                        << "Fail to init channel to " << ips_[node_id].c_str()
-                        << ":"
-                        << ports_[node_id];  // convert to log service port
+                    LOG(ERROR) << "Fail to init channel to "
+                               << log_nodes_[node_id].first.c_str() << ":"
+                               << log_nodes_[node_id]
+                                      .second;  // convert to log service port
                     return;
                 }
             }
             else
             {
                 if (channel.Init(
-                        ips_[node_id].c_str(),
+                        log_nodes_[node_id].first.c_str(),
                         static_cast<int>(
-                            ports_[node_id]),  // convert to log service port
+                            log_nodes_[node_id]
+                                .second),  // convert to log service port
                         &options) != 0)
                 {
-                    LOG(ERROR)
-                        << "Fail to init channel to " << ips_[node_id].c_str()
-                        << ":"
-                        << ports_[node_id];  // convert to log service port
+                    LOG(ERROR) << "Fail to init channel to "
+                               << log_nodes_[node_id].first.c_str() << ":"
+                               << log_nodes_[node_id]
+                                      .second;  // convert to log service port
                     return;
                 }
             }
@@ -146,9 +151,193 @@ std::shared_ptr<brpc::Channel> LogAgent::GetChannel(uint32_t log_group_id)
     return log_channel_it->second;
 }
 
+/**
+ * @brief Refresh log leader by asking braft service. Note that
+ * braft::rtb::refresh_leader is a blocking call, don't use it in TxProcessor
+ * thread.
+ */
 int LogAgent::RefreshLeader(uint32_t log_group_id, int timeout_ms)
 {
+    // Leader is unknown or outdated in the route table. Asks the route table to
+    // refresh the leader by sending RPCs.
+    std::string log_group_name("lg");
+    log_group_name.append(std::to_string(log_group_id));
+    butil::Status st = braft::rtb::refresh_leader(log_group_name, timeout_ms);
+
+    if (!st.ok())
+    {
+        // Not sure about the leader, sleep for a while and the ask
+        // again.
+        LOG(WARNING) << "Fail to refresh_leader : " << st;
+        return -1;
+    }
+
+    braft::PeerId leader;
+    // Selects the leader of the target group from the route table.
+    if (braft::rtb::select_leader(log_group_name, &leader) != 0)
+    {
+        LOG(WARNING) << "Fail to select leader : " << st;
+        return -1;
+    }
+    std::string leader_ip_port;
+    if (leader.type_ == braft::PeerId::Type::EndPoint)
+    {
+        leader_ip_port.append(butil::endpoint2str(leader.addr).c_str());
+    }
+    else
+    {
+        leader_ip_port.append(leader.hostname_addr.to_string());
+    }
+
+    size_t comma_pos = leader_ip_port.find(':');
+    assert(comma_pos != std::string::npos);
+    std::string leader_ip_str = leader_ip_port.substr(0, comma_pos);
+    uint16_t leader_port = std::stoi(leader_ip_port.substr(comma_pos + 1));
+    std::shared_lock<std::shared_mutex> lock(config_map_mutex_);
+    bool found = false;
+    brpc::Channel *channel = nullptr;
+    std::unique_ptr<brpc::Channel> channel_uptr;
+
+    for (size_t idx = 0;
+         idx < log_group_config_map_.at(log_group_id).group_nodes_.size();
+         ++idx)
+    {
+        uint32_t node_id =
+            log_group_config_map_.at(log_group_id).group_nodes_[idx];
+        if (log_nodes_.at(node_id).first == leader_ip_str &&
+            log_nodes_.at(node_id).second == leader_port)
+        {
+            uint32_t old_node_id = lg_leader_cache_.at(log_group_id)
+                                       .load(std::memory_order_acquire);
+
+            if (old_node_id != node_id)
+            {
+                LOG(INFO) << "Refresh log group:" << log_group_id
+                          << " leader from node_id: " << old_node_id
+                          << " to node_id: " << node_id;
+            }
+            lg_leader_cache_.at(log_group_id)
+                .store(node_id, std::memory_order_release);
+            found = true;
+            channel = log_channel_map_.at(node_id).get();
+            break;
+        }
+    }
+
+    lock.unlock();
+
+    if (!found)
+    {
+        channel_uptr = std::make_unique<brpc::Channel>();
+        brpc::ChannelOptions options;
+        // The original timeout is 500ms, which is too short to finish the
+        // raft log request. Increase it to 10 seconds.
+        options.timeout_ms = 10000;
+        options.max_retry = 3;
+        if (leader.type_ != braft::PeerId::Type::EndPoint)
+        {
+            // for case `ips_[node_id]` is hostname format.
+            std::string naming_service_url;
+            braft::HostNameAddr hostname_addr(leader_ip_str, leader_port);
+            braft::HostNameAddr2NSUrl(hostname_addr, naming_service_url);
+            if (channel_uptr->Init(naming_service_url.c_str(),
+                                   braft::LOAD_BALANCER_NAME,
+                                   &options) != 0)
+            {
+                LOG(ERROR) << "Fail to init channel to " << leader_ip_str << ":"
+                           << leader_port;
+                return -1;
+            }
+        }
+        else
+        {
+            if (channel_uptr->Init(leader_ip_str.c_str(),
+                                   static_cast<int>(leader_port),
+                                   &options) != 0)
+            {
+                LOG(ERROR) << "Fail to init channel to " << leader_ip_str << ":"
+                           << leader_port;
+                return -1;
+            }
+        }
+
+        channel = channel_uptr.get();
+    }
+
+    LogService_Stub stub(channel);
+    GetLogGroupConfigRequest request;
+    request.set_log_group_id(log_group_id);
+    GetLogGroupConfigResponse resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(1000);
+    stub.GetLogGroupConfig(&cntl, &request, &resp, nullptr);
+    if (cntl.Failed())
+    {
+        LOG(ERROR) << "Failed to GetLogGroupConfig, error text:"
+                   << cntl.ErrorText();
+        return -1;
+    }
+
+    if (resp.error() == true)
+    {
+        LOG(ERROR) << "Failed to GetLogGroupConfig";
+        return -1;
+    }
+
+    std::vector<std::string> ips;
+    std::vector<uint16_t> ports;
+    for (int i = 0; i < resp.ip_size(); ++i)
+    {
+        ips.push_back(resp.ip(i));
+        ports.push_back(resp.port(i));
+    }
+
+    if (!UpdateLogGroupConfig(ips, ports, log_group_id))
+    {
+        // Failed to get latest log group config. It is not safe to visit
+        // the new leader now since it might not been added to log group config
+        // map yet.
+        return -1;
+    }
+
+    if (!found)
+    {
+        lock.lock();
+        // If we did not find the leader node before updating group nodes,
+        // try to find the leader node again after updating group nodes.
+        for (size_t idx = 0;
+             idx < log_group_config_map_.at(log_group_id).group_nodes_.size();
+             ++idx)
+        {
+            uint32_t node_id =
+                log_group_config_map_.at(log_group_id).group_nodes_[idx];
+            if (log_nodes_.at(node_id).first == leader_ip_str &&
+                log_nodes_.at(node_id).second == leader_port)
+            {
+                uint32_t old_node_id = lg_leader_cache_.at(log_group_id)
+                                           .load(std::memory_order_acquire);
+
+                if (old_node_id != node_id)
+                {
+                    LOG(INFO) << "Refresh log group:" << log_group_id
+                              << " leader from node_id: " << old_node_id
+                              << " to node_id: " << node_id;
+                }
+                lg_leader_cache_.at(log_group_id)
+                    .store(node_id, std::memory_order_release);
+                break;
+            }
+        }
+    }
+
     return 0;
+}
+
+void LogAgent::RequestRefreshLeader(uint32_t log_group_id)
+{
+    std::unique_lock lk(check_leader_mutex_);
+    request_check_group_leader_ = log_group_id;
+    check_leader_cv_.notify_one();
 }
 
 void LogAgent::WriteLog(uint32_t log_group_id,
@@ -304,6 +493,22 @@ void LogAgent::ReplayLog(uint32_t cc_node_group_id,
         // finishing failover and not being able to serve anyway.)
         while (true)
         {
+            // get the leader of log_group using blocking RefreshLeader call.
+            int err = RefreshLeader(log_group_id);
+            while (err != 0)
+            {
+                DLOG(INFO) << "Refresh log group " << log_group_id
+                           << " leader failed";
+                if (interrupt.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+
+                using namespace std::chrono_literals;
+                std::this_thread::sleep_for(2s);
+                err = RefreshLeader(log_group_id);
+            }
+
             auto channel = GetChannel(log_group_id);
             if (channel == nullptr)
             {
@@ -458,6 +663,44 @@ void LogAgent::TransferLeader(uint32_t log_group_id, uint32_t leader_idx)
     }
 }
 
+void LogAgent::CheckLeaderRun()
+{
+    int request_check_group_leader = -1;
+    while (true)
+    {
+        if (request_check_group_leader != -1)
+        {
+            RefreshLeader(request_check_group_leader);
+            request_check_group_leader = -1;
+        }
+        else
+        {
+            for (auto lg_id : log_group_ids_)
+            {
+                RefreshLeader(lg_id, 500);
+            }
+        }
+
+        std::unique_lock lk(check_leader_mutex_);
+        check_leader_cv_.wait_for(lk,
+                                  std::chrono::seconds(RefreshThreshold),
+                                  [this] {
+                                      return request_check_group_leader_ !=
+                                                 -1 ||
+                                             check_leader_terminate_;
+                                  });
+        if (request_check_group_leader_ != -1)
+        {
+            request_check_group_leader = request_check_group_leader_;
+            request_check_group_leader_ = -1;
+        }
+        if (check_leader_terminate_)
+        {
+            break;
+        }
+    }
+}
+
 void LogAgent::UpdateLeaderCache(uint32_t lg_id, uint32_t node_id)
 {
     std::shared_lock<std::shared_mutex> lock(config_map_mutex_);
@@ -488,24 +731,30 @@ bool LogAgent::UpdateLogGroupConfig(std::vector<std::string> &ips,
 
     // Create channels to new nodes
     std::unordered_map<uint32_t, std::shared_ptr<brpc::Channel>> new_channels;
-    std::vector<std::string> new_ips;
-    std::vector<uint16_t> new_ports;
-    uint32_t next_node_id = ips_.size();
+    std::unordered_map<uint32_t, std::pair<std::string, uint16_t>>
+        new_log_nodes;
+    std::vector<uint32_t> new_log_node_ids;
+    uint32_t next_node_id = 0;
     for (uint32_t i = 0; i < ips.size(); ++i)
     {
         bool found = false;
-        for (uint32_t j = 0; j < ips_.size(); ++j)
+        for (const auto &[node_id, log_node] : log_nodes_)
         {
-            if (ips_[j] == ips[i] && ports_[j] == ports[i])
+            if (log_node.first == ips[i] && log_node.second == ports[i])
             {
+                new_log_node_ids.push_back(node_id);
                 found = true;
                 break;
             }
         }
         if (!found)
         {
-            new_ips.push_back(ips[i]);
-            new_ports.push_back(ports[i]);
+            while (log_nodes_.find(next_node_id) != log_nodes_.end())
+            {
+                ++next_node_id;
+            }
+            new_log_nodes.try_emplace(next_node_id, ips[i], ports[i]);
+            new_log_node_ids.push_back(next_node_id);
             // Create a new channel
             std::shared_ptr<brpc::Channel> channel =
                 std::make_shared<brpc::Channel>();
@@ -544,23 +793,58 @@ bool LogAgent::UpdateLogGroupConfig(std::vector<std::string> &ips,
             new_channels[next_node_id++] = std::move(channel);
         }
     }
+    // sort the log node ids in group in order
+    std::sort(new_log_node_ids.begin(), new_log_node_ids.end());
+    // Compare with old log node ids in group. Check if any node is removed.
+
+    std::vector<uint32_t> removed_log_node_ids;
+    const auto &old_log_node_ids =
+        log_group_config_map_.at(log_group_id).group_nodes_;
+
+    // Use a set for efficient lookup of new node IDs
+    std::unordered_set<uint32_t> new_node_id_set(new_log_node_ids.begin(),
+                                                 new_log_node_ids.end());
+
+    // Find nodes that exist in old group but not in new group
+    for (const auto &old_node_id : old_log_node_ids)
+    {
+        if (new_node_id_set.find(old_node_id) == new_node_id_set.end())
+        {
+            // This old node is not in the new configuration
+            removed_log_node_ids.push_back(old_node_id);
+        }
+    }
+
+    // Check if we have removed any nodes from cluster
     share_lock.unlock();
+
+    if (removed_log_node_ids.empty() && new_log_nodes.empty())
+    {
+        // No change in log group config
+        return true;
+    }
 
     {
         std::lock_guard<std::shared_mutex> lock(config_map_mutex_);
-        for (uint32_t i = 0; i < new_ips.size(); ++i)
+        // Remove removed nodes from log_nodes_
+        for (const auto &node_id : removed_log_node_ids)
         {
-            ips_.push_back(new_ips[i]);
-            ports_.push_back(new_ports[i]);
+            log_nodes_.erase(node_id);
+            log_channel_map_.erase(node_id);
         }
-        log_group_replica_num_ = ips.size() > log_group_replica_num_
-                                     ? ips.size()
-                                     : log_group_replica_num_;
+        // Add new nodes to log_nodes_
+        for (const auto &[node_id, log_node] : new_log_nodes)
+        {
+            log_nodes_[node_id] = std::move(log_node);
+        }
+
         for (auto &channel_pair : new_channels)
         {
             log_channel_map_[channel_pair.first] =
                 std::move(channel_pair.second);
         }
+        log_group_config_map_.at(log_group_id).group_nodes_ =
+            std::move(new_log_node_ids);
         lg_leader_cache_.try_emplace(log_group_id, log_group_id);
 
         std::string log_group_name = "lg" + std::to_string(log_group_id);

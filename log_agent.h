@@ -28,6 +28,7 @@
 #include <bthread/bthread.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -36,7 +37,7 @@
 #include <vector>
 
 #include "log.pb.h"
-
+#include "log_util.h"
 namespace txlog
 {
 /*
@@ -59,12 +60,19 @@ public:
 
     LogAgent(const LogAgent &rhs) = delete;
 
-    LogAgent() : log_group_cnt_(0), log_group_replica_num_(0)
+    LogAgent() : log_group_cnt_(0)
     {
+        check_leader_thd_ = std::thread([this] { CheckLeaderRun(); });
     }
 
     ~LogAgent()
     {
+        {
+            std::unique_lock lk(check_leader_mutex_);
+            check_leader_terminate_ = true;
+            check_leader_cv_.notify_one();
+        }
+        check_leader_thd_.join();
     }
 
     /**
@@ -80,6 +88,11 @@ public:
      * Refresh the cache with the new leader information.
      */
     int RefreshLeader(uint32_t log_group_id, int timeout_ms = 1000);
+
+    /*
+     * Request the background check leader thread to refresh leader.
+     */
+    void RequestRefreshLeader(uint32_t log_group_id);
 
     /*
      * WriteLog request append new log record.
@@ -175,6 +188,8 @@ public:
     uint32_t LogGroupReplicaNum()
     {
         std::shared_lock<std::shared_mutex> lock(config_map_mutex_);
+        // TODO(liunyl): For now only accommodate the case for 1 log group.
+        // We need to pass in the exact log group configuration in the future.
         return log_group_replica_num_;
     }
 
@@ -204,12 +219,13 @@ private:
     void CheckLeaderRun();
 
     std::shared_mutex config_map_mutex_;
-    std::vector<std::string> ips_;
-    std::vector<uint16_t> ports_;
+    std::unordered_map<uint32_t, std::pair<std::string, uint16_t>> log_nodes_;
 
     uint32_t log_group_cnt_;
     uint32_t log_group_replica_num_;
     std::vector<uint32_t> log_group_ids_;
+    std::unordered_map<uint32_t, LogUtil::RaftGroupConfig>
+        log_group_config_map_;
 
     std::unordered_map<uint32_t, std::shared_ptr<brpc::Channel>>
         log_channel_map_;
@@ -217,5 +233,12 @@ private:
     // leader cache of log group: map key is log_group_id, map value is the
     // node_id.
     std::unordered_map<uint32_t, std::atomic<uint32_t>> lg_leader_cache_;
+
+    // The background thread that periodically check the new log group leader.
+    std::thread check_leader_thd_;
+    int16_t request_check_group_leader_{-1};
+    bool check_leader_terminate_{false};
+    std::mutex check_leader_mutex_;
+    std::condition_variable check_leader_cv_;
 };
 }  // namespace txlog
