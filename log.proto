@@ -7,8 +7,18 @@ import "google/protobuf/empty.proto";
 enum CcTableType {
   Primary = 0;
   Secondary = 1;
-  Catalog = 2;
-  RangePartition = 3;
+  UniqueSecondary = 2;
+  Catalog = 3;
+  RangePartition = 4;
+  RangeBucket = 5;
+  ClusterConfig = 6;
+}
+
+enum TableEngine {
+  None = 0;
+  EloqSql = 1;
+  EloqKv = 2;
+  EloqDoc = 3;
 }
 
 message UpsertTableMessage {
@@ -32,63 +42,66 @@ message UpsertIndexMessage {
 
 message SchemaOpMessage {
   string table_name_str = 1;
-  CcTableType table_type = 5;
-  bytes new_catalog_blob = 2;
-  bytes old_catalog_blob = 3;
-  bytes alter_table_info_blob = 7;
+  TableEngine table_engine = 2;
+  CcTableType table_type = 3;
+  bytes new_catalog_blob = 4;
+  bytes old_catalog_blob = 5;
+  bytes alter_table_info_blob = 6;
   enum Stage {
     PrepareSchema = 0;
-    PrepareData = 2;
-    CommitSchema = 11;
-    CleanSchema = 20;
+    PrepareData = 1;
+    CommitSchema = 2;
+    CleanSchema = 3;
   }
-  Stage stage = 4;
+  Stage stage = 7;
   // Old catalog_ts
-  uint64 catalog_ts = 6;
+  uint64 catalog_ts = 8;
   oneof schema_op {
-    UpsertTableMessage table_op = 10;
-    UpsertColumnMessage column_op = 11;
-    RenameColumnMessage column_rename_op = 12;
-    UpsertIndexMessage index_op = 13;
+    UpsertTableMessage table_op = 9;
+    UpsertColumnMessage column_op = 10;
+    RenameColumnMessage column_rename_op = 11;
+    UpsertIndexMessage index_op = 12;
   }
   enum LastKeyType {
     NormalKey = 0;
     PosInfKey = 1;
   }
-  LastKeyType last_key_type = 15;
+  LastKeyType last_key_type = 13;
   bytes last_key_value = 14;
 }
 
 message UpdateCatalogMessage {
   string table_name_str = 1;
-  CcTableType table_type = 11;
+  TableEngine table_engine = 2;
+  CcTableType table_type = 3;
   // The new name of the table. Empty if no renaming.
-  bytes new_table_name = 2;
-  CcTableType new_table_type = 12;
+  bytes new_table_name = 4;
+  CcTableType new_table_type = 5;
   // Whether the table/schema is deleted
-  bool is_deleted = 3;
+  bool is_deleted = 6;
   // The binary representation of the new catalog
-  bytes catalog_blob = 4;
+  bytes catalog_blob = 7;
   // Two arrays for zero or more old, new column names
-  repeated string old_column_names = 5;
-  repeated string new_column_names = 6;
+  repeated string old_column_names = 8;
+  repeated string new_column_names = 9;
   // Two arrays for zero or more old, new index names
-  repeated string old_index_names = 7;
-  repeated string new_index_names = 8;
+  repeated string old_index_names = 10;
+  repeated string new_index_names = 11;
   // Zero or more added index names
   // An index's indexed columns can be retrieved from
   // the catalog decoded from catalog_blob using the name.
-  repeated string added_indexes = 9;
+  repeated string added_indexes = 12;
   // Zero or more deleted index names
-  repeated string deleted_indexes = 10;
+  repeated string deleted_indexes = 13;
 }
 
 message SplitRangeOpMessage  {
   string table_name = 1;
-  int32 partition_id = 2;
-    oneof range_key {
-    bytes range_key_value = 3;
-    bool range_key_neg_inf = 4;
+  TableEngine table_engine = 2;
+  int32 partition_id = 3;
+  oneof range_key {
+    bytes range_key_value = 4;
+    bool range_key_neg_inf = 5;
   }
   repeated int32 slice_sizes = 6;
   repeated bytes slice_keys = 7;
@@ -195,8 +208,9 @@ message CheckClusterScaleStatusResponse {
 message ClusterScaleOpMessage {
   enum ScaleOpType
   {
-    AddNode = 0;
+    AddNodeGroup = 0;
     RemoveNode = 1;
+    AddNodeGroupPeers = 2;
   }
   ScaleOpType event_type = 1;
   repeated NodegroupConfig new_ng_configs = 2;
@@ -211,6 +225,11 @@ message DataLogMessage {
   // A map mapping the cc node group ID to the records
   // the tx commits in this cc node group.
   map<uint32, bytes> node_txn_logs = 1;
+
+  // An insert operation triggers a logical update table operation.
+  // For example, when mongo insert an array value into a singlekey field,
+  // it will change the singlekey index to a multiKey index.
+  repeated SchemaOpMessage schema_logs = 2; 
 }
 
 message LogContentMessage {
@@ -328,10 +347,11 @@ message LogRequest {
 message LogResponse {
   enum ResponseStatus {
     Success = 0;
-    Fail = 1;
-    Unknown = 2;
-    DuplicateMigrationTx = 3;
-    DuplicateClusterScaleTx = 4;
+    Fail = 1; // WriteLog term not match or other failure
+    NotLeader = 2;
+    Unknown = 3;
+    DuplicateMigrationTx = 4;
+    DuplicateClusterScaleTx = 5;
   }
   ResponseStatus response_status = 1;
   oneof response {
@@ -410,6 +430,16 @@ message ChangePeersResponse {
   bool success = 1;
 }
 
+message GetLogGroupConfigRequest {
+  uint32 log_group_id = 1;
+}
+
+message GetLogGroupConfigResponse {
+  bool error = 1;
+  repeated string ip = 2;
+  repeated uint32 port = 3;
+}
+
 service LogService {
   rpc WriteLog(LogRequest) returns (LogResponse);
   rpc ReplayLog(LogRequest) returns (LogResponse);
@@ -426,6 +456,7 @@ service LogService {
   rpc DetachLog(google.protobuf.Empty) returns (google.protobuf.Empty);
   rpc AddPeer(AddPeerRequest) returns (ChangePeersResponse);
   rpc RemovePeer(RemovePeerRequest) returns (ChangePeersResponse);
+  rpc GetLogGroupConfig(GetLogGroupConfigRequest) returns (GetLogGroupConfigResponse);
 }
 
 message ReplayRecordMsg {
