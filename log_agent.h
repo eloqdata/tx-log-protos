@@ -28,7 +28,10 @@
 #include <bthread/bthread.h>
 
 #include <atomic>
+#if defined(OPEN_LOG_SERVICE)
+#else
 #include <condition_variable>
+#endif
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -62,17 +65,23 @@ public:
 
     LogAgent() : log_group_cnt_(0)
     {
+#if defined(OPEN_LOG_SERVICE)
+#else
         check_leader_thd_ = std::thread([this] { CheckLeaderRun(); });
+#endif
     }
 
     ~LogAgent()
     {
+#if defined(OPEN_LOG_SERVICE)
+#else
         {
             std::unique_lock lk(check_leader_mutex_);
             check_leader_terminate_ = true;
             check_leader_cv_.notify_one();
         }
         check_leader_thd_.join();
+#endif
     }
 
     /**
@@ -216,7 +225,10 @@ public:
                               uint32_t log_group_id);
 
 private:
+#if defined(OPEN_LOG_SERVICE)
+#else
     void CheckLeaderRun();
+#endif
 
     std::shared_mutex config_map_mutex_;
     std::unordered_map<uint32_t, std::pair<std::string, uint16_t>> log_nodes_;
@@ -237,8 +249,11 @@ private:
     // The background thread that periodically check the new log group leader.
     std::thread check_leader_thd_;
     int16_t request_check_group_leader_{-1};
+#if defined(OPEN_LOG_SERVICE)
+#else
     bool check_leader_terminate_{false};
     std::mutex check_leader_mutex_;
     std::condition_variable check_leader_cv_;
+#endif
 };
 }  // namespace txlog
