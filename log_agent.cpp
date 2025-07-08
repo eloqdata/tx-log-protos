@@ -150,7 +150,12 @@ std::shared_ptr<brpc::Channel> LogAgent::GetChannel(uint32_t log_group_id)
     }
     return log_channel_it->second;
 }
-
+#if defined(OPEN_LOG_SERVICE)
+int LogAgent::RefreshLeader(uint32_t log_group_id, int timeout_ms)
+{
+    return 0;
+}
+#else
 /**
  * @brief Refresh log leader by asking braft service. Note that
  * braft::rtb::refresh_leader is a blocking call, don't use it in TxProcessor
@@ -332,13 +337,21 @@ int LogAgent::RefreshLeader(uint32_t log_group_id, int timeout_ms)
 
     return 0;
 }
+#endif
 
+#if defined(OPEN_LOG_SERVICE)
+void LogAgent::RequestRefreshLeader(uint32_t log_group_id)
+{
+    return;
+}
+#else
 void LogAgent::RequestRefreshLeader(uint32_t log_group_id)
 {
     std::unique_lock lk(check_leader_mutex_);
     request_check_group_leader_ = log_group_id;
     check_leader_cv_.notify_one();
 }
+#endif
 
 void LogAgent::WriteLog(uint32_t log_group_id,
                         brpc::Controller *controller,
@@ -493,6 +506,8 @@ void LogAgent::ReplayLog(uint32_t cc_node_group_id,
         // finishing failover and not being able to serve anyway.)
         while (true)
         {
+#if defined(OPEN_LOG_SERVICE)
+#else
             // get the leader of log_group using blocking RefreshLeader call.
             int err = RefreshLeader(log_group_id);
             while (err != 0)
@@ -508,7 +523,7 @@ void LogAgent::ReplayLog(uint32_t cc_node_group_id,
                 std::this_thread::sleep_for(2s);
                 err = RefreshLeader(log_group_id);
             }
-
+#endif
             auto channel = GetChannel(log_group_id);
             if (channel == nullptr)
             {
@@ -662,7 +677,8 @@ void LogAgent::TransferLeader(uint32_t log_group_id, uint32_t leader_idx)
                    << log_group_id;
     }
 }
-
+#if defined(OPEN_LOG_SERVICE)
+#else
 void LogAgent::CheckLeaderRun()
 {
     int request_check_group_leader = -1;
@@ -700,6 +716,7 @@ void LogAgent::CheckLeaderRun()
         }
     }
 }
+#endif
 
 void LogAgent::UpdateLeaderCache(uint32_t lg_id, uint32_t node_id)
 {
