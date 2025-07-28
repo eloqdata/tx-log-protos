@@ -125,10 +125,8 @@ public:
             std::string log_group_name("lg");
             log_group_name.append(std::to_string(log_group_id));
 
-            log_raft_group_config.try_emplace(log_group_id,
-                                              log_group_name,
-                                              log_group_conf,
-                                              log_group_nodes);
+            log_raft_group_config.try_emplace(
+                log_group_id, log_group_name, log_group_conf, log_group_nodes);
 
             ++log_group_id;
         }
