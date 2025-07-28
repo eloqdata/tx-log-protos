@@ -496,6 +496,7 @@ message ReplayMessage {
   repeated ReplaySplitRangeMsg split_range_op_msgs = 5;
   ReplayClusterScaleMsg cluster_scale_op_msg = 6;
   ReplayFinishMsg finish = 7;
+  bool is_lock_recovery = 8;
 }
 
 message LogReplayConnectRequest {
