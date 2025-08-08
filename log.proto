@@ -496,6 +496,7 @@ message ReplayFinishMsg {
   uint32 log_group_id = 1;
   uint32 latest_txn_no = 2;
   uint64 last_ckpt_ts = 3;
+  uint64 max_ts_in_log = 4;
 }
 
 message ReplayMessage {
