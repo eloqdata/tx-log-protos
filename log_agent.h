@@ -22,7 +22,6 @@
 #pragma once
 #include <braft/raft.h>
 #include <braft/route_table.h>
-#include <braft/util.h>
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <bthread/bthread.h>
