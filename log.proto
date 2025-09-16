@@ -262,9 +262,16 @@ message WriteLogRequest {
   uint32 log_group_id = 8;
 }
 
+message LeaderInfo {
+  int64 term = 1;
+  bytes ip = 2;
+}
+
 message WriteLogResponse {
   string redirect = 1;
   uint64 newest_cluster_scale_txn = 2;
+  // latest leader info of all node groups
+  map<uint32, LeaderInfo> node_group_leader_info = 3;
 }
 
 message ReplayLogRequest {
