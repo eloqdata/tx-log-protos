@@ -450,6 +450,19 @@ message GetLogGroupConfigResponse {
   repeated uint32 port = 3;
 }
 
+message CreateBackupRequest {
+  uint32 lg_ng_id = 1;
+  string backup_name = 2;
+  repeated string backup_files = 3;
+  uint64 backup_ts = 4;
+}
+
+message CreateBackupResponse{
+  uint32 lg_ng_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
 service LogService {
   rpc WriteLog(LogRequest) returns (LogResponse);
   rpc ReplayLog(LogRequest) returns (LogResponse);
@@ -467,6 +480,7 @@ service LogService {
   rpc AddPeer(AddPeerRequest) returns (ChangePeersResponse);
   rpc RemovePeer(RemovePeerRequest) returns (ChangePeersResponse);
   rpc GetLogGroupConfig(GetLogGroupConfigRequest) returns (GetLogGroupConfigResponse);
+  rpc CreateBackup(CreateBackupRequest) returns (CreateBackupResponse);
 }
 
 message ReplayRecordMsg {
