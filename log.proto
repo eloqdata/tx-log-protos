@@ -451,14 +451,14 @@ message GetLogGroupConfigResponse {
 }
 
 message CreateBackupRequest {
-  uint32 lg_ng_id = 1;
+  uint32 log_group_id = 1;
   string backup_name = 2;
   repeated string backup_files = 3;
   uint64 backup_ts = 4;
 }
 
 message CreateBackupResponse{
-  uint32 lg_ng_id = 1;
+  uint32 log_group_id = 1;
   bool success = 2;
   string error_message = 3;
 }
